@@ -1,6 +1,6 @@
 from flask import Blueprint, jsonify, request
-from flask_jwt_extended import create_access_token, jwt_required, get_jwt
-from .models import db, User
+from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required, get_jwt
+from models import db, User
 from os import getenv
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
@@ -42,3 +42,13 @@ def login():
 
     token = create_access_token(identity=u.id, additional_claims={"role": u.role, "username": u.username})
     return jsonify({"ok": True, "access_token": token})
+
+@auth_bp.route('/refresh', methods=['POST'])
+@jwt_required(refresh=True)
+def refresh():
+    try:
+        current_user = get_jwt_identity()
+        new_token = create_access_token(identity=current_user)
+        return jsonify({"ok": True, "access_token": new_token})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 401

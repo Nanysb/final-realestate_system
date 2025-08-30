@@ -1,52 +1,154 @@
-// src/pages/Login.jsx
-import { useState } from "react";
-import axios from "../api/axios";
-import { useNavigate } from "react-router-dom";
+import React, { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import { useApi } from '../hooks/useApi';
+import API from '../api/axios';
+import { setAuthToken } from '../utils/auth';
+import { SEO, LoadingSpinner } from '../components';
+import './Login.css';
 
-export default function Login() {
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
+const Login = () => {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const { login, isAuthenticated } = useAuth();
+  const { loading, error, callApi, clearError } = useApi();
   const navigate = useNavigate();
 
-  const handleLogin = async (e) => {
+  useEffect(() => {
+    if (isAuthenticated) {
+      navigate('/dashboard', { replace: true });
+    }
+  }, [isAuthenticated, navigate]);
+
+  const handleSubmit = async (e) => {
     e.preventDefault();
+    clearError();
+
+    if (!username.trim() || !password.trim()) {
+      return;
+    }
+
     try {
-      const res = await axios.post("/auth/login", { username, password });
-      if (res.data.ok) {
-        localStorage.setItem("token", res.data.access_token);
-        navigate("/dashboard");
-      } else {
-        setError(res.data.error || "فشل تسجيل الدخول");
+      const response = await callApi(() => 
+        API.post('/auth/login', {
+          username: username.trim(),
+          password: password.trim()
+        })
+      );
+
+      if (response.ok) {
+        setAuthToken(response.access_token);
+        login(response.access_token, { 
+          username: username.trim(), 
+          role: 'admin' 
+        });
+        navigate('/dashboard', { replace: true });
       }
-    } catch (err) {
-      setError(err.response?.data?.error || "حدث خطأ");
+    } catch (error) {
+      // Error is handled by useApi hook
     }
   };
 
+  const handleDemoLogin = () => {
+    setUsername('admin');
+    setPassword('');
+    setTimeout(() => {
+      handleSubmit(new Event('submit'));
+    }, 100);
+  };
+
+  if (loading) {
+    return <LoadingSpinner message="جاري تسجيل الدخول..." />;
+  }
+
   return (
-    <div className="flex items-center justify-center h-screen bg-gray-100">
-      <form onSubmit={handleLogin} className="bg-white p-8 rounded shadow-md w-96">
-        <h1 className="text-2xl font-bold mb-6">تسجيل الدخول</h1>
-        {error && <p className="text-red-500 mb-4">{error}</p>}
-        <input
-          type="text"
-          placeholder="اسم المستخدم"
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          className="w-full mb-4 p-2 border rounded"
-        />
-        <input
-          type="password"
-          placeholder="كلمة المرور"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          className="w-full mb-4 p-2 border rounded"
-        />
-        <button type="submit" className="w-full bg-blue-500 text-white py-2 rounded hover:bg-blue-600">
-          تسجيل الدخول
-        </button>
-      </form>
-    </div>
+    <>
+      <SEO title="تسجيل الدخول - نظام العقارات" />
+      <div className="login-container">
+        <div className="login-card">
+          <div className="login-header">
+            <div className="logo">
+              <h1>🏢 نظام العقارات</h1>
+            </div>
+            <p>يرجى تسجيل الدخول للمتابعة</p>
+          </div>
+
+          <form onSubmit={handleSubmit} className="login-form">
+            <div className="input-group">
+              <label>اسم المستخدم</label>
+              <input
+                type="text"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="أدخل اسم المستخدم"
+                required
+                autoComplete="username"
+                className="login-input"
+                disabled={loading}
+              />
+            </div>
+
+            <div className="input-group">
+              <label>كلمة المرور</label>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="أدخل كلمة المرور"
+                required
+                autoComplete="current-password"
+                className="login-input"
+                disabled={loading}
+              />
+            </div>
+
+            {error && (
+              <div className="error-message">
+                ⚠️ {error}
+                <button 
+                  type="button" 
+                  onClick={clearError}
+                  className="error-close"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+
+            <button 
+              type="submit" 
+              className="login-btn"
+              disabled={loading}
+            >
+              {loading ? (
+                <>
+                  <span className="spinner"></span>
+                  جاري التسجيل...
+                </>
+              ) : (
+                'تسجيل الدخول'
+              )}
+            </button>
+
+            <div className="login-options">
+              <button 
+                type="button" 
+                className="demo-login-btn"
+                onClick={handleDemoLogin}
+                disabled={loading}
+              >
+                🚀 تجربة سريعة (بيانات تجريبية)
+              </button>
+            </div>
+          </form>
+
+          <div className="login-footer">
+            <p>نظام إدارة العقارات © 2024</p>
+          </div>
+        </div>
+      </div>
+    </>
   );
-}
+};
+
+export default Login;

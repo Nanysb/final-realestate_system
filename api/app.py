@@ -1,114 +1,137 @@
+# api/app.py
 import os
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-from flask_jwt_extended import JWTManager, jwt_required, get_jwt
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+from functools import wraps
+from pathlib import Path
+
 from dotenv import load_dotenv
+from flask import Flask, jsonify, request, send_from_directory, url_for
+from flask_cors import CORS
+from flask_jwt_extended import JWTManager, verify_jwt_in_request, get_jwt
+from flask_migrate import Migrate
+from werkzeug.utils import secure_filename
+from werkzeug.exceptions import HTTPException
 
-from .models import db, User, Company, Project, Unit
-from .utils import paginate_query
-from .auth import auth_bp
+from models import db, User, Company, Project, Unit
+from utils import paginate_query
+from auth import auth_bp
 
+load_dotenv()  # Load environment variables from api/.env
 
-load_dotenv()  # load .env
+ALLOWED_IMAGE_EXT = {"png", "jpg", "jpeg", "gif", "webp"}
 
-def create_app():
-    app = Flask(__name__)
-    CORS(app)
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_IMAGE_EXT
 
-    db_url = os.getenv("DATABASE_URL", "sqlite:///realestate.db")
-    app.config["SQLALCHEMY_DATABASE_URI"] = db_url
-    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-    app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "change-this")
-
-    db.init_app(app)
-    with app.app_context():
-        db.create_all()
-        # إنشاء أدمن ابتدائي لو مش موجود
-        admin_user = os.getenv("ADMIN_DEFAULT_USER", "admin")
-        admin_pass = os.getenv("ADMIN_DEFAULT_PASS", "admin123")
-        if not User.query.filter_by(username=admin_user).first():
-            u = User(username=admin_user, role="admin")
-            u.set_password(admin_pass)
-            db.session.add(u)
-            db.session.commit()
-
-    jwt = JWTManager(app)
-
-    # Blueprints
-    app.register_blueprint(auth_bp)
-
-    # ------------------ Public Endpoints ------------------
-    @app.get("/api/companies")
-    def get_companies():
-        companies = Company.query.all()
-        return jsonify({"ok": True, "companies": [{"id": c.id, "slug": c.slug, "name": c.name} for c in companies]})
-
-    @app.get("/api/projects")
-    def get_projects():
-        company_slug = request.args.get("company_slug")
-        q = Project.query
-        if company_slug:
-            comp = Company.query.filter_by(slug=company_slug).first()
-            if not comp:
-                return jsonify({"ok": False, "error": "Company not found"}), 404
-            q = q.filter_by(company_id=comp.id)
-
-        items = q.order_by(Project.created_at.desc()).all()
-        res = [{
-            "id": p.id, "slug": p.slug, "title": p.title,
-            "location": p.location, "company_id": p.company_id
-        } for p in items]
-        return jsonify({"ok": True, "projects": res})
-
-    @app.get("/api/units")
-    def list_units():
-        project_id = request.args.get("project_id", type=int)
-        min_sqm = request.args.get("min_sqm", type=float)
-        max_price = request.args.get("max_price", type=int)
-        floor = request.args.get("floor")
-
-        q = Unit.query
-        if project_id:
-            q = q.filter_by(project_id=project_id)
-        if min_sqm:
-            q = q.filter(Unit.sqm >= min_sqm)
-        if max_price:
-            # filter using computed total_price: sqm*price_per_sqm
-            # approximate with price_per_sqm <= max_price / sqm (or fetch and filter after)
-            # Simpler: fetch all then filter in memory
-            pass
-
-        # paginate
-        items, page, limit = paginate_query(q.order_by(Unit.created_at.desc()))
-        units = [u.to_dict() for u in items]
-
-        # if max_price provided, filter post-query to keep it simple
-        if max_price:
-            units = [u for u in units if u["total_price"] <= max_price]
-
-        if floor:
-            units = [u for u in units if str(u["floor"]) == str(floor)]
-
-        return jsonify({"ok": True, "page": page, "limit": limit, "units": units})
-
-    @app.get("/api/units/<int:unit_id>")
-    def get_unit(unit_id):
-        u = Unit.query.get_or_404(unit_id)
-        return jsonify({"ok": True, "unit": u.to_dict()})
-
-    # ------------------ Admin Endpoints (JWT) ------------------
-    def admin_required():
+def admin_required(fn):
+    """Decorator to require JWT + admin role"""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            verify_jwt_in_request()
+        except Exception as e:
+            return jsonify({"ok": False, "error": "Token missing or invalid", "detail": str(e)}), 401
         claims = get_jwt()
         if claims.get("role") != "admin":
-            return False
-        return True
-
-    # Companies
-    @app.post("/api/companies")
-    @jwt_required()
-    def create_company():
-        if not admin_required():
             return jsonify({"ok": False, "error": "Admins only"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
+
+def create_app():
+    app = Flask(__name__, instance_relative_config=True)
+    CORS(app, origins=["http://localhost:3000"], supports_credentials=True)
+
+    # ---------- Config ----------
+    instance_path = Path(app.instance_path)
+    os.makedirs(instance_path, exist_ok=True)
+
+    db_url = os.getenv("DATABASE_URL", f"sqlite:///{instance_path / 'realestate.db'}")
+    jwt_secret = os.getenv("JWT_SECRET_KEY", "change-this-secret")
+
+    app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    app.config["JWT_SECRET_KEY"] = jwt_secret
+
+    uploads = instance_path / "uploads"
+    os.makedirs(uploads, exist_ok=True)
+    app.config["UPLOAD_FOLDER"] = str(uploads)
+
+    # ---------- Logging ----------
+    logs_dir = Path.cwd() / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(logs_dir / "api.log", maxBytes=10*1024*1024, backupCount=5, encoding="utf-8")
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    handler.setFormatter(formatter)
+    handler.setLevel(logging.INFO)
+    app.logger.addHandler(handler)
+    app.logger.setLevel(logging.INFO)
+    app.logger.info("Starting API app")
+
+    # ---------- Extensions ----------
+    db.init_app(app)
+    JWTManager(app)
+
+    migrate = Migrate(app, db)
+
+    # ---------- Error handlers ----------
+    @app.errorhandler(HTTPException)
+    def handle_http_error(e):
+        return jsonify({"ok": False, "error": e.name, "message": e.description}), e.code
+
+    @app.errorhandler(Exception)
+    def handle_exception(e):
+        app.logger.exception("Unhandled exception")
+        return jsonify({"ok": False, "error": "Internal Server Error", "message": str(e)}), 500
+
+    # ---------- Blueprints ----------
+    try:
+        app.register_blueprint(auth_bp)
+    except Exception as e:
+        app.logger.warning("Could not register auth blueprint: %s", e)
+
+    # ---------- Helpers ----------
+    def save_uploaded_files(files_list):
+        saved_files = []
+        for f in files_list:
+            if f and allowed_file(f.filename):
+                filename = secure_filename(f.filename)
+                target = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+                base, ext = os.path.splitext(filename)
+                idx = 1
+                while os.path.exists(target):
+                    filename = f"{base}_{idx}{ext}"
+                    target = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+                    idx += 1
+                f.save(target)
+                saved_files.append(filename)
+        return saved_files
+
+    # ---------- Public Endpoints ----------
+    @app.route("/")
+    def home():
+        return jsonify({"message": "Real Estate API is running Good job Radoo "})
+
+    @app.route("/api/health")
+    def health():
+        return jsonify({"ok": True, "status": "API running"})
+
+    # ---------- Companies ----------
+    @app.route("/api/companies", methods=["GET"])
+    def get_companies():
+        companies = Company.query.all()
+        res = [c.to_dict() for c in companies]
+        return jsonify({"ok": True, "data": res})
+
+    @app.route("/api/companies/<string:slug>", methods=["GET"])
+    def get_company_by_slug(slug):
+        company = Company.query.filter_by(slug=slug).first_or_404()
+        return jsonify({"ok": True, "data": company.to_dict()})
+
+    @app.route("/api/companies", methods=["POST"])
+    @admin_required
+    def create_company():
         data = request.get_json() or {}
         slug = data.get("slug")
         name = data.get("name")
@@ -116,96 +139,270 @@ def create_app():
             return jsonify({"ok": False, "error": "slug/name required"}), 400
         if Company.query.filter_by(slug=slug).first():
             return jsonify({"ok": False, "error": "slug exists"}), 409
-        c = Company(slug=slug, name=name)
+        
+        c = Company(
+            slug=slug, 
+            name=name,
+            logo=data.get("logo"),
+            description=data.get("description"),
+            contact_info=json.dumps(data.get("contact_info", {})) if data.get("contact_info") else None
+        )
         db.session.add(c)
         db.session.commit()
-        return jsonify({"ok": True, "company": {"id": c.id, "slug": c.slug, "name": c.name}})
+        return jsonify({"ok": True, "data": c.to_dict()}), 201
 
-    @app.put("/api/companies/<int:cid>")
-    @jwt_required()
+    @app.route("/api/companies/<int:cid>", methods=["PUT"])
+    @admin_required
     def update_company(cid):
-        if not admin_required():
-            return jsonify({"ok": False, "error": "Admins only"}), 403
         c = Company.query.get_or_404(cid)
         data = request.get_json() or {}
+        
         if "slug" in data:
-            # ensure unique
             if Company.query.filter(Company.slug == data["slug"], Company.id != cid).first():
                 return jsonify({"ok": False, "error": "slug exists"}), 409
             c.slug = data["slug"]
+        
         if "name" in data:
             c.name = data["name"]
+        
+        if "logo" in data:
+            c.logo = data["logo"]
+        
+        if "description" in data:
+            c.description = data["description"]
+        
+        if "contact_info" in data:
+            c.contact_info = json.dumps(data["contact_info"]) if data["contact_info"] else None
+        
         db.session.commit()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "data": c.to_dict()})
 
-    @app.delete("/api/companies/<int:cid>")
-    @jwt_required()
+    @app.route("/api/companies/<int:cid>", methods=["DELETE"])
+    @admin_required
     def delete_company(cid):
-        if not admin_required():
-            return jsonify({"ok": False, "error": "Admins only"}), 403
         c = Company.query.get_or_404(cid)
         db.session.delete(c)
         db.session.commit()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "message": "Company deleted successfully"})
 
-    # Projects
-    @app.post("/api/projects")
-    @jwt_required()
+    # ---------- Projects ----------
+    @app.route("/api/projects", methods=["GET"])
+    def get_projects():
+        company_slug = request.args.get("company_slug")
+        status = request.args.get("status")
+        
+        q = Project.query
+        if company_slug:
+            comp = Company.query.filter_by(slug=company_slug).first()
+            if not comp:
+                return jsonify({"ok": False, "error": "Company not found"}), 404
+            q = q.filter_by(company_id=comp.id)
+        
+        if status:
+            q = q.filter_by(status=status)
+        
+        items = q.order_by(Project.order.asc().nullslast(), Project.created_at.desc()).all()
+        res = [p.to_dict() for p in items]
+        
+        # Add full image URLs
+        for project in res:
+            project["images"] = [url_for("uploaded_file", filename=fn, _external=True) 
+                                for fn in project["images"]]
+        
+        return jsonify({"ok": True, "data": res})
+
+    @app.route("/api/projects/<int:pid>", methods=["GET"])
+    def get_project(pid):
+        project = Project.query.get_or_404(pid)
+        data = project.to_dict()
+        data["images"] = [url_for("uploaded_file", filename=fn, _external=True) 
+                         for fn in data["images"]]
+        return jsonify({"ok": True, "data": data})
+
+    @app.route("/api/projects", methods=["POST"])
+    @admin_required
     def create_project():
-        if not admin_required():
-            return jsonify({"ok": False, "error": "Admins only"}), 403
-        data = request.get_json() or {}
+        if request.content_type and request.content_type.startswith("multipart/form-data"):
+            data = request.form.to_dict()
+            # Parse JSON fields
+            for field in ["features"]:
+                if field in data and data[field]:
+                    try:
+                        data[field] = json.loads(data[field])
+                    except json.JSONDecodeError:
+                        pass
+        else:
+            data = request.get_json() or {}
+
         company_slug = data.get("company_slug")
         comp = Company.query.filter_by(slug=company_slug).first()
         if not comp:
             return jsonify({"ok": False, "error": "Company not found"}), 404
 
-        p = Project(
-            company_id=comp.id,
-            slug=data.get("slug", ""),
-            title=data.get("title", ""),
-            location=data.get("location"),
-            description=data.get("description")
-        )
-        if not p.slug or not p.title:
+        slug = data.get("slug") or ""
+        title = data.get("title") or ""
+        if not slug or not title:
             return jsonify({"ok": False, "error": "slug/title required"}), 400
 
+        p = Project(
+            company_id=comp.id,
+            slug=slug,
+            title=title,
+            location=data.get("location"),
+            description=data.get("description"),
+            features=json.dumps(data.get("features", [])),
+            status=data.get("status", "active"),
+            order=data.get("order", 0)
+        )
+        
         db.session.add(p)
         db.session.commit()
-        return jsonify({"ok": True, "project": {
-            "id": p.id, "slug": p.slug, "title": p.title, "company_id": p.company_id
-        }})
 
-    @app.put("/api/projects/<int:pid>")
-    @jwt_required()
+        # Handle image uploads
+        saved_files = []
+        if request.files:
+            files = request.files.getlist("images")
+            saved_files = save_uploaded_files(files)
+            
+            if saved_files:
+                # Get existing images and add new ones
+                existing_images = p.get_images()
+                existing_images.extend(saved_files)
+                p.images = json.dumps(existing_images)
+                db.session.commit()
+
+        return jsonify({"ok": True, "data": p.to_dict()}), 201
+
+    @app.route("/api/projects/<int:pid>", methods=["PUT"])
+    @admin_required
     def update_project(pid):
-        if not admin_required():
-            return jsonify({"ok": False, "error": "Admins only"}), 403
         p = Project.query.get_or_404(pid)
-        data = request.get_json() or {}
-        for k in ["slug", "title", "location", "description"]:
-            if k in data:
-                setattr(p, k, data[k])
+        
+        if request.content_type and request.content_type.startswith("multipart/form-data"):
+            data = request.form.to_dict()
+            # Parse JSON fields
+            for field in ["features"]:
+                if field in data and data[field]:
+                    try:
+                        data[field] = json.loads(data[field])
+                    except json.JSONDecodeError:
+                        pass
+        else:
+            data = request.get_json() or {}
+            
+        if "slug" in data:
+            # Check if slug is already used by another project
+            if Project.query.filter(Project.slug == data["slug"], Project.id != pid).first():
+                return jsonify({"ok": False, "error": "slug exists"}), 409
+            p.slug = data["slug"]
+            
+        for field in ["title", "location", "description", "status", "order"]:
+            if field in data:
+                setattr(p, field, data[field])
+                
+        if "features" in data:
+            p.features = json.dumps(data["features"])
+                
         db.session.commit()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "data": p.to_dict()})
 
-    @app.delete("/api/projects/<int:pid>")
-    @jwt_required()
+    @app.route("/api/projects/<int:pid>", methods=["DELETE"])
+    @admin_required
     def delete_project(pid):
-        if not admin_required():
-            return jsonify({"ok": False, "error": "Admins only"}), 403
         p = Project.query.get_or_404(pid)
         db.session.delete(p)
         db.session.commit()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "message": "Project deleted successfully"})
 
-    # Units
-    @app.post("/api/units")
-    @jwt_required()
+    @app.route("/api/projects/<int:pid>/upload", methods=["POST"])
+    @admin_required
+    def upload_project_files(pid):
+        p = Project.query.get_or_404(pid)
+        if "images" not in request.files:
+            return jsonify({"ok": False, "error": "No images field"}), 400
+
+        files = request.files.getlist("images")
+        saved_files = save_uploaded_files(files)
+
+        if saved_files:
+            # Get existing images and add new ones
+            existing_images = p.get_images()
+            existing_images.extend(saved_files)
+            p.images = json.dumps(existing_images)
+            db.session.commit()
+
+        return jsonify({"ok": True, "data": saved_files})
+
+    # ---------- Units ----------
+    @app.route("/api/units", methods=["GET"])
+    def list_units():
+        project_id = request.args.get("project_id", type=int)
+        min_sqm = request.args.get("min_sqm", type=float)
+        max_price = request.args.get("max_price", type=int)
+        floor = request.args.get("floor")
+        status = request.args.get("status")
+        bedrooms = request.args.get("bedrooms", type=int)
+        bathrooms = request.args.get("bathrooms", type=int)
+
+        q = Unit.query
+        if project_id:
+            q = q.filter_by(project_id=project_id)
+        if min_sqm:
+            q = q.filter(Unit.sqm >= min_sqm)
+        if status:
+            q = q.filter_by(status=status)
+        if bedrooms:
+            q = q.filter(Unit.bedrooms == bedrooms)
+        if bathrooms:
+            q = q.filter(Unit.bathrooms == bathrooms)
+
+        items, page, limit = paginate_query(q.order_by(Unit.created_at.desc()))
+        units = [u.to_dict() for u in items]
+
+        if max_price:
+            units = [u for u in units if u.get("total_price", float("inf")) <= max_price]
+        if floor:
+            units = [u for u in units if str(u.get("floor")) == str(floor)]
+
+        # Add full image URLs
+        for unit in units:
+            unit["images"] = [url_for("uploaded_file", filename=fn, _external=True) 
+                             for fn in unit["images"]]
+            if unit["floor_plan"]:
+                unit["floor_plan"] = url_for("uploaded_file", filename=unit["floor_plan"], _external=True)
+
+        return jsonify({
+            "ok": True, 
+            "data": units,
+            "pagination": {"page": page, "limit": limit, "total": len(units)}
+        })
+
+    @app.route("/api/units/<int:uid>", methods=["GET"])
+    def get_unit(uid):
+        u = Unit.query.get_or_404(uid)
+        data = u.to_dict()
+        # Add full image URLs
+        data["images"] = [url_for("uploaded_file", filename=fn, _external=True) 
+                         for fn in data["images"]]
+        if data["floor_plan"]:
+            data["floor_plan"] = url_for("uploaded_file", filename=data["floor_plan"], _external=True)
+        return jsonify({"ok": True, "data": data})
+
+    @app.route("/api/units", methods=["POST"])
+    @admin_required
     def create_unit():
-        if not admin_required():
-            return jsonify({"ok": False, "error": "Admins only"}), 403
-        data = request.get_json() or {}
+        if request.content_type and request.content_type.startswith("multipart/form-data"):
+            data = request.form.to_dict()
+            # Parse JSON fields
+            for field in ["amenities", "metadata"]:
+                if field in data and data[field]:
+                    try:
+                        data[field] = json.loads(data[field])
+                    except json.JSONDecodeError:
+                        pass
+        else:
+            data = request.get_json() or {}
+            
         project_id = data.get("project_id")
         code = data.get("code")
         sqm = data.get("sqm")
@@ -215,57 +412,187 @@ def create_app():
         if not all([project_id, code, sqm, price_per_sqm, floor]):
             return jsonify({"ok": False, "error": "project_id, code, sqm, price_per_sqm, floor required"}), 400
 
-        # ensure project exists
         _ = Project.query.get_or_404(project_id)
-
         u = Unit(
             project_id=project_id,
             code=str(code),
             sqm=float(sqm),
             price_per_sqm=int(price_per_sqm),
             floor=str(floor),
+            title=data.get("title"),
+            bedrooms=data.get("bedrooms", 0),
+            bathrooms=data.get("bathrooms", 0),
+            amenities=json.dumps(data.get("amenities", [])),
+            unit_metadata=json.dumps(data.get("metadata", {})),
             status=data.get("status", "available")
         )
+        
         db.session.add(u)
         db.session.commit()
-        return jsonify({"ok": True, "unit": u.to_dict()})
+        
+        # Handle image uploads
+        saved_files = []
+        if request.files:
+            files = request.files.getlist("images")
+            saved_files = save_uploaded_files(files)
+            
+            if saved_files:
+                u.images = json.dumps(saved_files)
+                db.session.commit()
+                
+        # Handle floor plan upload
+        if "floor_plan" in request.files:
+            floor_plan_file = request.files["floor_plan"]
+            if floor_plan_file and allowed_file(floor_plan_file.filename):
+                filename = secure_filename(floor_plan_file.filename)
+                target = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+                base, ext = os.path.splitext(filename)
+                idx = 1
+                while os.path.exists(target):
+                    filename = f"{base}_{idx}{ext}"
+                    target = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+                    idx += 1
+                floor_plan_file.save(target)
+                u.floor_plan = filename
+                db.session.commit()
 
-    @app.put("/api/units/<int:uid>")
-    @jwt_required()
+        return jsonify({"ok": True, "data": u.to_dict()}), 201
+
+    @app.route("/api/units/<int:uid>", methods=["PUT"])
+    @admin_required
     def update_unit(uid):
-        if not admin_required():
-            return jsonify({"ok": False, "error": "Admins only"}), 403
         u = Unit.query.get_or_404(uid)
-        data = request.get_json() or {}
-        for k in ["code", "sqm", "price_per_sqm", "floor", "status"]:
-            if k in data and data[k] is not None:
-                if k in ["sqm"]:
-                    setattr(u, k, float(data[k]))
-                elif k in ["price_per_sqm"]:
-                    setattr(u, k, int(data[k]))
-                else:
-                    setattr(u, k, str(data[k]))
+        
+        if request.content_type and request.content_type.startswith("multipart/form-data"):
+            data = request.form.to_dict()
+            # Parse JSON fields
+            for field in ["amenities", "metadata"]:
+                if field in data and data[field]:
+                    try:
+                        data[field] = json.loads(data[field])
+                    except json.JSONDecodeError:
+                        pass
+        else:
+            data = request.get_json() or {}
+            
+        for field in ["code", "title", "floor", "status"]:
+            if field in data and data[field] is not None:
+                setattr(u, field, str(data[field]))
+                
+        if "sqm" in data and data["sqm"] is not None:
+            u.sqm = float(data["sqm"])
+            
+        if "price_per_sqm" in data and data["price_per_sqm"] is not None:
+            u.price_per_sqm = int(data["price_per_sqm"])
+            
+        if "bedrooms" in data and data["bedrooms"] is not None:
+            u.bedrooms = int(data["bedrooms"])
+            
+        if "bathrooms" in data and data["bathrooms"] is not None:
+            u.bathrooms = int(data["bathrooms"])
+            
+        if "amenities" in data:
+            u.amenities = json.dumps(data["amenities"])
+            
+        if "metadata" in data:
+            u.unit_metadata = json.dumps(data["metadata"])
+            
+        # Handle image uploads
+        if "images" in request.files:
+            files = request.files.getlist("images")
+            saved_files = save_uploaded_files(files)
+            
+            if saved_files:
+                # Get existing images and add new ones
+                existing_images = u.get_images()
+                existing_images.extend(saved_files)
+                u.images = json.dumps(existing_images)
+                
+        # Handle floor plan upload
+        if "floor_plan" in request.files:
+            floor_plan_file = request.files["floor_plan"]
+            if floor_plan_file and allowed_file(floor_plan_file.filename):
+                filename = secure_filename(floor_plan_file.filename)
+                target = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+                base, ext = os.path.splitext(filename)
+                idx = 1
+                while os.path.exists(target):
+                    filename = f"{base}_{idx}{ext}"
+                    target = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+                    idx += 1
+                floor_plan_file.save(target)
+                u.floor_plan = filename
+        
         db.session.commit()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "data": u.to_dict()})
 
-    @app.delete("/api/units/<int:uid>")
-    @jwt_required()
+    @app.route("/api/units/<int:uid>", methods=["DELETE"])
+    @admin_required
     def delete_unit(uid):
-        if not admin_required():
-            return jsonify({"ok": False, "error": "Admins only"}), 403
         u = Unit.query.get_or_404(uid)
         db.session.delete(u)
         db.session.commit()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "message": "Unit deleted successfully"})
 
-    # Health
-    @app.get("/api/health")
-    def health():
-        return jsonify({"ok": True, "status": "API running"})
+    @app.route("/api/units/<int:uid>/upload", methods=["POST"])
+    @admin_required
+    def upload_unit_files(uid):
+        u = Unit.query.get_or_404(uid)
+        if "images" not in request.files and "floor_plan" not in request.files:
+            return jsonify({"ok": False, "error": "No files provided"}), 400
+
+        saved_files = []
+        # Handle images
+        if "images" in request.files:
+            files = request.files.getlist("images")
+            saved_files = save_uploaded_files(files)
+            
+            if saved_files:
+                # Get existing images and add new ones
+                existing_images = u.get_images()
+                existing_images.extend(saved_files)
+                u.images = json.dumps(existing_images)
+                
+        # Handle floor plan
+        if "floor_plan" in request.files:
+            floor_plan_file = request.files["floor_plan"]
+            if floor_plan_file and allowed_file(floor_plan_file.filename):
+                filename = secure_filename(floor_plan_file.filename)
+                target = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+                base, ext = os.path.splitext(filename)
+                idx = 1
+                while os.path.exists(target):
+                    filename = f"{base}_{idx}{ext}"
+                    target = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+                    idx += 1
+                floor_plan_file.save(target)
+                u.floor_plan = filename
+                saved_files.append(filename)
+
+        db.session.commit()
+        return jsonify({"ok": True, "data": saved_files})
+
+    # Serve uploaded files
+    @app.route("/api/uploads/<path:filename>")
+    def uploaded_file(filename):
+        return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+
+    # ---------- App context initialization ----------
+    with app.app_context():
+        db.create_all()
+        admin_user = os.getenv("ADMIN_DEFAULT_USER", "admin")
+        admin_pass = os.getenv("ADMIN_DEFAULT_PASS", "admin123")
+        if not User.query.filter_by(username=admin_user).first():
+            u = User(username=admin_user, role="admin")
+            u.set_password(admin_pass)
+            db.session.add(u)
+            db.session.commit()
+            app.logger.info("Created default admin user '%s'", admin_user)
 
     return app
 
-# ------------- Entrypoint -------------
+# ---------- Entrypoint ----------
 if __name__ == "__main__":
+    from waitress import serve
     app = create_app()
-    app.run(debug=True)
+    serve(app, host="127.0.0.1", port=5000)

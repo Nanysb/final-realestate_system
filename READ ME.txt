@@ -1,0 +1,33 @@
+
+تفعيل البيئه 
+
+.\venv\Scripts\Activate.ps1
+
+
+
+
+تشغيل ال API 
+
+cd api
+python app.py
+
+
+
+تشغيل الواجه React 
+
+cd admin-dashboard
+npm start
+
+
+
+تشغيل البوت 
+
+
+D:\BOT\realestate_system\bot> 
+
+python bot\telegram_bot.py
+
+
+# أنشئ بيانات تجريبية
+python run_seed.py
+D:\BOT\realestate_system\api> python seed.py 

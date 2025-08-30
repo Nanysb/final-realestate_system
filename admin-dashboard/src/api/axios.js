@@ -1,20 +1,51 @@
-// src/api/axios.js
-import axios from "axios";
+import axios from 'axios';
+import { getAuthToken, refreshToken } from '../utils/auth'; // أزل clearAuthToken
 
-const API = "http://127.0.0.1:5000/api"; // رابط الـ API بتاعك
+const API = axios.create({
+  baseURL: 'http://localhost:5000/api',
+  timeout: 15000,
+});
 
-const axiosInstance = axios.create({
-  baseURL: API,
-  headers: {
-    "Content-Type": "application/json"
+// Request Interceptor
+API.interceptors.request.use((config) => {
+  const token = getAuthToken();
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
   }
-});
-
-// interceptor لإضافة الـ JWT لكل request تلقائيًا
-axiosInstance.interceptors.request.use(config => {
-  const token = localStorage.getItem("token"); // تخزين التوكن بعد تسجيل الدخول
-  if (token) config.headers["Authorization"] = `Bearer ${token}`;
   return config;
+}, (error) => {
+  return Promise.reject(error);
 });
 
-export default axiosInstance;
+// Response Interceptor - معدل لمنع التسجيل الخروج التلقائي
+API.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const originalRequest = error.config;
+    
+    // إذا كان الخطأ 401 ولم نكن قد حاولنا بالفعل refresh
+    if (error.response?.status === 401 && !originalRequest._retry) {
+      originalRequest._retry = true;
+      
+      console.log('🔄 Attempting token refresh...');
+      const refreshed = await refreshToken();
+      
+      if (refreshed) {
+        // إعادة المحاولة بالـ token الجديد
+        const newToken = getAuthToken();
+        originalRequest.headers.Authorization = `Bearer ${newToken}`;
+        return API(originalRequest);
+      }
+    }
+    
+    // إذا فشل الـ refresh أو كان خطأ آخر
+    if (error.response?.status === 401) {
+      console.log('❌ Unauthorized, but NOT logging out automatically');
+      // لا تسجيل خروج تلقائي هنا!
+    }
+    
+    return Promise.reject(error);
+  }
+);
+
+export default API;
