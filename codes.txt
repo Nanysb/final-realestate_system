@@ -1,0 +1,724 @@
+داخل مجلد api 
+
+1 - app.py 
+
+import os
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from flask_jwt_extended import JWTManager, jwt_required, get_jwt
+from dotenv import load_dotenv
+
+from .models import db, User, Company, Project, Unit
+from .utils import paginate_query
+from .auth import auth_bp
+
+
+load_dotenv()  # load .env
+
+def create_app():
+    app = Flask(__name__)
+    CORS(app)
+
+    db_url = os.getenv("DATABASE_URL", "sqlite:///realestate.db")
+    app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "change-this")
+
+    db.init_app(app)
+    with app.app_context():
+        db.create_all()
+        # إنشاء أدمن ابتدائي لو مش موجود
+        admin_user = os.getenv("ADMIN_DEFAULT_USER", "admin")
+        admin_pass = os.getenv("ADMIN_DEFAULT_PASS", "admin123")
+        if not User.query.filter_by(username=admin_user).first():
+            u = User(username=admin_user, role="admin")
+            u.set_password(admin_pass)
+            db.session.add(u)
+            db.session.commit()
+
+    jwt = JWTManager(app)
+
+    # Blueprints
+    app.register_blueprint(auth_bp)
+
+    # ------------------ Public Endpoints ------------------
+    @app.get("/api/companies")
+    def get_companies():
+        companies = Company.query.all()
+        return jsonify({"ok": True, "companies": [{"id": c.id, "slug": c.slug, "name": c.name} for c in companies]})
+
+    @app.get("/api/projects")
+    def get_projects():
+        company_slug = request.args.get("company_slug")
+        q = Project.query
+        if company_slug:
+            comp = Company.query.filter_by(slug=company_slug).first()
+            if not comp:
+                return jsonify({"ok": False, "error": "Company not found"}), 404
+            q = q.filter_by(company_id=comp.id)
+
+        items = q.order_by(Project.created_at.desc()).all()
+        res = [{
+            "id": p.id, "slug": p.slug, "title": p.title,
+            "location": p.location, "company_id": p.company_id
+        } for p in items]
+        return jsonify({"ok": True, "projects": res})
+
+    @app.get("/api/units")
+    def list_units():
+        project_id = request.args.get("project_id", type=int)
+        min_sqm = request.args.get("min_sqm", type=float)
+        max_price = request.args.get("max_price", type=int)
+        floor = request.args.get("floor")
+
+        q = Unit.query
+        if project_id:
+            q = q.filter_by(project_id=project_id)
+        if min_sqm:
+            q = q.filter(Unit.sqm >= min_sqm)
+        if max_price:
+            # filter using computed total_price: sqm*price_per_sqm
+            # approximate with price_per_sqm <= max_price / sqm (or fetch and filter after)
+            # Simpler: fetch all then filter in memory
+            pass
+
+        # paginate
+        items, page, limit = paginate_query(q.order_by(Unit.created_at.desc()))
+        units = [u.to_dict() for u in items]
+
+        # if max_price provided, filter post-query to keep it simple
+        if max_price:
+            units = [u for u in units if u["total_price"] <= max_price]
+
+        if floor:
+            units = [u for u in units if str(u["floor"]) == str(floor)]
+
+        return jsonify({"ok": True, "page": page, "limit": limit, "units": units})
+
+    @app.get("/api/units/<int:unit_id>")
+    def get_unit(unit_id):
+        u = Unit.query.get_or_404(unit_id)
+        return jsonify({"ok": True, "unit": u.to_dict()})
+
+    # ------------------ Admin Endpoints (JWT) ------------------
+    def admin_required():
+        claims = get_jwt()
+        if claims.get("role") != "admin":
+            return False
+        return True
+
+    # Companies
+    @app.post("/api/companies")
+    @jwt_required()
+    def create_company():
+        if not admin_required():
+            return jsonify({"ok": False, "error": "Admins only"}), 403
+        data = request.get_json() or {}
+        slug = data.get("slug")
+        name = data.get("name")
+        if not slug or not name:
+            return jsonify({"ok": False, "error": "slug/name required"}), 400
+        if Company.query.filter_by(slug=slug).first():
+            return jsonify({"ok": False, "error": "slug exists"}), 409
+        c = Company(slug=slug, name=name)
+        db.session.add(c)
+        db.session.commit()
+        return jsonify({"ok": True, "company": {"id": c.id, "slug": c.slug, "name": c.name}})
+
+    @app.put("/api/companies/<int:cid>")
+    @jwt_required()
+    def update_company(cid):
+        if not admin_required():
+            return jsonify({"ok": False, "error": "Admins only"}), 403
+        c = Company.query.get_or_404(cid)
+        data = request.get_json() or {}
+        if "slug" in data:
+            # ensure unique
+            if Company.query.filter(Company.slug == data["slug"], Company.id != cid).first():
+                return jsonify({"ok": False, "error": "slug exists"}), 409
+            c.slug = data["slug"]
+        if "name" in data:
+            c.name = data["name"]
+        db.session.commit()
+        return jsonify({"ok": True})
+
+    @app.delete("/api/companies/<int:cid>")
+    @jwt_required()
+    def delete_company(cid):
+        if not admin_required():
+            return jsonify({"ok": False, "error": "Admins only"}), 403
+        c = Company.query.get_or_404(cid)
+        db.session.delete(c)
+        db.session.commit()
+        return jsonify({"ok": True})
+
+    # Projects
+    @app.post("/api/projects")
+    @jwt_required()
+    def create_project():
+        if not admin_required():
+            return jsonify({"ok": False, "error": "Admins only"}), 403
+        data = request.get_json() or {}
+        company_slug = data.get("company_slug")
+        comp = Company.query.filter_by(slug=company_slug).first()
+        if not comp:
+            return jsonify({"ok": False, "error": "Company not found"}), 404
+
+        p = Project(
+            company_id=comp.id,
+            slug=data.get("slug", ""),
+            title=data.get("title", ""),
+            location=data.get("location"),
+            description=data.get("description")
+        )
+        if not p.slug or not p.title:
+            return jsonify({"ok": False, "error": "slug/title required"}), 400
+
+        db.session.add(p)
+        db.session.commit()
+        return jsonify({"ok": True, "project": {
+            "id": p.id, "slug": p.slug, "title": p.title, "company_id": p.company_id
+        }})
+
+    @app.put("/api/projects/<int:pid>")
+    @jwt_required()
+    def update_project(pid):
+        if not admin_required():
+            return jsonify({"ok": False, "error": "Admins only"}), 403
+        p = Project.query.get_or_404(pid)
+        data = request.get_json() or {}
+        for k in ["slug", "title", "location", "description"]:
+            if k in data:
+                setattr(p, k, data[k])
+        db.session.commit()
+        return jsonify({"ok": True})
+
+    @app.delete("/api/projects/<int:pid>")
+    @jwt_required()
+    def delete_project(pid):
+        if not admin_required():
+            return jsonify({"ok": False, "error": "Admins only"}), 403
+        p = Project.query.get_or_404(pid)
+        db.session.delete(p)
+        db.session.commit()
+        return jsonify({"ok": True})
+
+    # Units
+    @app.post("/api/units")
+    @jwt_required()
+    def create_unit():
+        if not admin_required():
+            return jsonify({"ok": False, "error": "Admins only"}), 403
+        data = request.get_json() or {}
+        project_id = data.get("project_id")
+        code = data.get("code")
+        sqm = data.get("sqm")
+        price_per_sqm = data.get("price_per_sqm")
+        floor = data.get("floor")
+
+        if not all([project_id, code, sqm, price_per_sqm, floor]):
+            return jsonify({"ok": False, "error": "project_id, code, sqm, price_per_sqm, floor required"}), 400
+
+        # ensure project exists
+        _ = Project.query.get_or_404(project_id)
+
+        u = Unit(
+            project_id=project_id,
+            code=str(code),
+            sqm=float(sqm),
+            price_per_sqm=int(price_per_sqm),
+            floor=str(floor),
+            status=data.get("status", "available")
+        )
+        db.session.add(u)
+        db.session.commit()
+        return jsonify({"ok": True, "unit": u.to_dict()})
+
+    @app.put("/api/units/<int:uid>")
+    @jwt_required()
+    def update_unit(uid):
+        if not admin_required():
+            return jsonify({"ok": False, "error": "Admins only"}), 403
+        u = Unit.query.get_or_404(uid)
+        data = request.get_json() or {}
+        for k in ["code", "sqm", "price_per_sqm", "floor", "status"]:
+            if k in data and data[k] is not None:
+                if k in ["sqm"]:
+                    setattr(u, k, float(data[k]))
+                elif k in ["price_per_sqm"]:
+                    setattr(u, k, int(data[k]))
+                else:
+                    setattr(u, k, str(data[k]))
+        db.session.commit()
+        return jsonify({"ok": True})
+
+    @app.delete("/api/units/<int:uid>")
+    @jwt_required()
+    def delete_unit(uid):
+        if not admin_required():
+            return jsonify({"ok": False, "error": "Admins only"}), 403
+        u = Unit.query.get_or_404(uid)
+        db.session.delete(u)
+        db.session.commit()
+        return jsonify({"ok": True})
+
+    # Health
+    @app.get("/api/health")
+    def health():
+        return jsonify({"ok": True, "status": "API running"})
+
+    return app
+
+# ------------- Entrypoint -------------
+if __name__ == "__main__":
+    app = create_app()
+    app.run(debug=True)
+
+
+
+
+
+___________________________________________
+
+2 - seed.py
+
+from .app import create_app
+from .models import db, Company, Project, Unit
+
+app = create_app()
+
+with app.app_context():
+    # ---------------- شركة ----------------
+    company_slug = "abu-zahra"
+    company_name = "Abu Zahra Developments"
+
+    company = Company.query.filter_by(slug=company_slug).first()
+    if not company:
+        company = Company(slug=company_slug, name=company_name)
+        db.session.add(company)
+        db.session.commit()
+        print(f"Company '{company_name}' added.")
+    else:
+        print(f"Company '{company_name}' already exists.")
+
+    # ---------------- مشروع ----------------
+    project_slug = "diva-1"
+    project_title = "Diva 1"
+    project_location = "New Cairo"
+    project_description = "Luxury project"
+
+    project = Project.query.filter_by(slug=project_slug, company_id=company.id).first()
+    if not project:
+        project = Project(
+            company_id=company.id,
+            slug=project_slug,
+            title=project_title,
+            location=project_location,
+            description=project_description
+        )
+        db.session.add(project)
+        db.session.commit()
+        print(f"Project '{project_title}' added.")
+    else:
+        print(f"Project '{project_title}' already exists.")
+
+    # ---------------- وحدات ----------------
+    units_data = [
+        {"code": "A-101", "sqm": 100, "price_per_sqm": 20000, "floor": "1"},
+        {"code": "A-102", "sqm": 120, "price_per_sqm": 19500, "floor": "2"},
+        {"code": "B-303", "sqm": 150, "price_per_sqm": 21000, "floor": "3"},
+    ]
+
+    existing_unit_codes = [u.code for u in Unit.query.filter_by(project_id=project.id).all()]
+    new_units = []
+
+    for udata in units_data:
+        if udata["code"] not in existing_unit_codes:
+            unit = Unit(
+                project_id=project.id,
+                code=udata["code"],
+                sqm=udata["sqm"],
+                price_per_sqm=udata["price_per_sqm"],
+                floor=udata["floor"]
+            )
+            new_units.append(unit)
+
+    if new_units:
+        db.session.add_all(new_units)
+        db.session.commit()
+        print(f"{len(new_units)} units added.")
+    else:
+        print("All units already exist.")
+
+    print("Seed done successfully.")
+
+
+______________________________
+
+3 - auth.py
+
+from flask import Blueprint, jsonify, request
+from flask_jwt_extended import create_access_token, jwt_required, get_jwt
+from .models import db, User
+from os import getenv
+
+auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
+
+@auth_bp.post("/register")
+@jwt_required()
+def register():
+    # مسموح فقط للأدمن
+    claims = get_jwt()
+    if claims.get("role") != "admin":
+        return jsonify({"ok": False, "error": "Admins only"}), 403
+
+    data = request.get_json() or {}
+    username = data.get("username")
+    password = data.get("password")
+    role = data.get("role", "user")
+
+    if not username or not password:
+        return jsonify({"ok": False, "error": "username/password required"}), 400
+
+    if User.query.filter_by(username=username).first():
+        return jsonify({"ok": False, "error": "User exists"}), 409
+
+    u = User(username=username, role=role)
+    u.set_password(password)
+    db.session.add(u)
+    db.session.commit()
+    return jsonify({"ok": True, "id": u.id, "username": u.username, "role": u.role})
+
+@auth_bp.post("/login")
+def login():
+    data = request.get_json() or {}
+    username = data.get("username")
+    password = data.get("password")
+
+    u = User.query.filter_by(username=username).first()
+    if not u or not u.check_password(password):
+        return jsonify({"ok": False, "error": "Invalid credentials"}), 401
+
+    token = create_access_token(identity=u.id, additional_claims={"role": u.role, "username": u.username})
+    return jsonify({"ok": True, "access_token": token})
+
+___________________________________________________
+
+4- models.py
+
+from flask_sqlalchemy import SQLAlchemy
+from datetime import datetime
+from werkzeug.security import generate_password_hash, check_password_hash
+
+db = SQLAlchemy()
+
+# ---------------------- User ----------------------
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(64), unique=True, index=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    role = db.Column(db.String(20), default="user")  # user | admin
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def set_password(self, raw):
+        self.password_hash = generate_password_hash(raw)
+
+    def check_password(self, raw):
+        return check_password_hash(self.password_hash, raw)
+
+# ---------------------- Company ----------------------
+class Company(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    slug = db.Column(db.String(80), unique=True, index=True, nullable=False)
+    name = db.Column(db.String(120), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    projects = db.relationship("Project", backref="company", cascade="all, delete-orphan")
+
+# ---------------------- Project ----------------------
+class Project(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey("company.id"), nullable=False)
+    slug = db.Column(db.String(80), index=True, nullable=False)
+    title = db.Column(db.String(150), nullable=False)
+    location = db.Column(db.String(150))
+    description = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    units = db.relationship("Unit", backref="project", cascade="all, delete-orphan")
+
+# ---------------------- Unit ----------------------
+class Unit(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    project_id = db.Column(db.Integer, db.ForeignKey("project.id"), nullable=False)
+    code = db.Column(db.String(80), index=True, nullable=False)
+    sqm = db.Column(db.Float, nullable=False)
+    price_per_sqm = db.Column(db.Integer, nullable=False)
+    floor = db.Column(db.String(20), nullable=False)
+    status = db.Column(db.String(20), default="available")  # available | sold | reserved
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    @property
+    def total_price(self):
+        return int(self.sqm * self.price_per_sqm)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "project_id": self.project_id,
+            "code": self.code,
+            "sqm": self.sqm,
+            "price_per_sqm": self.price_per_sqm,
+            "floor": self.floor,
+            "status": self.status,
+            "total_price": self.total_price
+        }
+_____________________________-
+
+5 - utils.py 
+
+from flask import request
+
+def paginate_query(query, default_limit=10, max_limit=50):
+    try:
+        page = int(request.args.get("page", 1))
+        limit = int(request.args.get("limit", default_limit))
+        if limit > max_limit:
+            limit = max_limit
+    except:
+        page, limit = 1, default_limit
+
+    items = query.offset((page - 1) * limit).limit(limit).all()
+    return items, page, limit
+
+
+________________________________________
+6 - .env 
+FLASK_ENV=development
+DATABASE_URL=sqlite:///realestate.db
+JWT_SECRET_KEY=change-this-please-very-secret
+ADMIN_DEFAULT_USER=admin
+ADMIN_DEFAULT_PASS=admin123
+
+______________________________________________
+
+
+داخل مجلد bot 
+
+
+
+1 -  telegram_bot.py
+
+import json
+import asyncio
+import httpx
+from functools import partial
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import ApplicationBuilder
+import os, json
+# -------- Load Config --------
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # فولدر هذا الملف
+CONFIG_PATH = os.path.join(BASE_DIR, "config_bot.json")
+
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    CFG = json.load(f)
+
+BOT_TOKEN = CFG["BOT_TOKEN"]
+API = CFG["API_BASE_URL"].rstrip("/")
+ADMIN_USER = CFG.get("ADMIN_USERNAME")
+ADMIN_PASS = CFG.get("ADMIN_PASSWORD")
+
+# per-chat admin tokens (MVP)
+ADMIN_TOKENS = {}  # chat_id -> token
+
+# -------- HTTP client --------
+client = httpx.AsyncClient(timeout=15.0)
+
+# -------- Helpers --------
+async def api_get(path, params=None, token=None):
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    r = await client.get(f"{API}{path}", params=params, headers=headers)
+    return r.json()
+
+async def api_post(path, data=None, token=None):
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    r = await client.post(f"{API}{path}", json=data or {}, headers=headers)
+    return r.json()
+
+async def api_put(path, data=None, token=None):
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    r = await client.put(f"{API}{path}", json=data or {}, headers=headers)
+    return r.json()
+
+async def api_delete(path, token=None):
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    r = await client.delete(f"{API}{path}", headers=headers)
+    return r.json()
+
+# -------- Commands --------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "أهلاً بك 👋\nاختر الشركة لعرض المشاريع:",
+        reply_markup=await companies_keyboard()
+    )
+
+async def companies_keyboard():
+    data = await api_get("/companies")
+    companies = data.get("companies", [])
+    buttons = [
+        [InlineKeyboardButton(c["name"], callback_data=f"comp:{c['slug']}")]
+        for c in companies
+    ]
+    return InlineKeyboardMarkup(buttons or [[InlineKeyboardButton("لا يوجد شركات", callback_data="noop")]])
+
+async def projects_keyboard(company_slug: str):
+    data = await api_get("/projects", params={"company_slug": company_slug})
+    projects = data.get("projects", [])
+    buttons = [
+        [InlineKeyboardButton(p["title"], callback_data=f"proj:{company_slug}:{p['id']}")]
+        for p in projects
+    ]
+    buttons.append([InlineKeyboardButton("⬅ رجوع", callback_data="back:companies")])
+    return InlineKeyboardMarkup(buttons or [[InlineKeyboardButton("لا يوجد مشاريع", callback_data=f"back:companies")]])
+
+async def units_keyboard(project_id: int, page: int = 1):
+    data = await api_get("/units", params={"project_id": project_id, "page": page, "limit": 10})
+    units = data.get("units", [])
+    buttons = []
+    for u in units:
+        label = f"{u['code']} | {u['sqm']}م² | دور {u['floor']} | إجمالي {u['total_price']}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"unit:{u['id']}")])
+    buttons.append([InlineKeyboardButton("⬅ رجوع", callback_data=f"back:projects")])
+    return InlineKeyboardMarkup(buttons or [[InlineKeyboardButton("لا يوجد وحدات", callback_data=f"back:projects")]])
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data.split(":")
+
+    if data[0] == "comp":
+        company_slug = data[1]
+        await q.edit_message_text(
+            f"مشاريع شركة: {company_slug}",
+            reply_markup=await projects_keyboard(company_slug)
+        )
+
+    elif data[0] == "proj":
+        company_slug, project_id = data[1], int(data[2])
+        kb = await units_keyboard(project_id)
+        await q.edit_message_text(
+            f"الوحدات المتاحة في المشروع {project_id}",
+            reply_markup=kb
+        )
+
+    elif data[0] == "unit":
+        unit_id = int(data[1])
+        u = await api_get(f"/units/{unit_id}")
+        if not u.get("ok"):
+            await q.edit_message_text("حدث خطأ في جلب بيانات الوحدة.")
+            return
+        unit = u["unit"]
+        msg = (
+            f"📌 كود: {unit['code']}\n"
+            f"المساحة: {unit['sqm']} م²\n"
+            f"الدور: {unit['floor']}\n"
+            f"سعر المتر: {unit['price_per_sqm']} جنيه\n"
+            f"الإجمالي: {unit['total_price']} جنيه\n"
+            f"الحالة: {unit['status']}"
+        )
+        await q.edit_message_text(msg)
+
+    elif data[0] == "back":
+        if data[1] == "companies":
+            await q.edit_message_text(
+                "اختر الشركة:",
+                reply_markup=await companies_keyboard()
+            )
+        elif data[1] == "projects":
+            # ما عندناش state للشركة هنا، نرجّع لقائمة الشركات
+            await q.edit_message_text(
+                "اختر الشركة:",
+                reply_markup=await companies_keyboard()
+            )
+
+# -------- Admin Quick Login (MVP) --------
+async def adminlogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    # هنستخدم بيانات من config كحساب الخدمة
+    resp = await api_post("/auth/login", data={"username": ADMIN_USER, "password": ADMIN_PASS})
+    if not resp.get("ok"):
+        await update.message.reply_text("فشل الدخول كأدمن.")
+        return
+    ADMIN_TOKENS[chat_id] = resp["access_token"]
+    await update.message.reply_text("✅ تم تسجيل الدخول كأدمن لهذا الشات.")
+
+# /add_unit project_id code sqm price_per_sqm floor
+async def add_unit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    token = ADMIN_TOKENS.get(chat_id)
+    if not token:
+        await update.message.reply_text("⚠️ لازم تعمل /adminlogin أولاً.")
+        return
+
+    try:
+        project_id = int(context.args[0])
+        code = context.args[1]
+        sqm = float(context.args[2])
+        price_per_sqm = int(context.args[3])
+        floor = context.args[4]
+    except:
+        await update.message.reply_text("الاستخدام: /add_unit <project_id> <code> <sqm> <price_per_sqm> <floor>")
+        return
+
+    resp = await api_post("/units", token=token, data={
+        "project_id": project_id,
+        "code": code,
+        "sqm": sqm,
+        "price_per_sqm": price_per_sqm,
+        "floor": floor
+    })
+    if resp.get("ok"):
+        u = resp["unit"]
+        await update.message.reply_text(f"✅ تمت إضافة وحدة: {u['code']} (ID={u['id']})")
+    else:
+        await update.message.reply_text(f"❌ فشل: {resp.get('error')}")
+
+async def stop_client(app: Application):
+    await client.aclose()
+    await app.stop()
+
+def main():
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("adminlogin", adminlogin))
+    application.add_handler(CommandHandler("add_unit", add_unit))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+
+    # Run
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
+
+
+
+______________________________________________________
+
+2 - config_bot.json
+
+
+
+{
+  "BOT_TOKEN": "8415187777:AAHF_UB5_h0iGiCD7-LuDE9BOHNw8mqtaIs",
+  "API_BASE_URL": "http://127.0.0.1:5000/api",
+  "ADMIN_USERNAME": "admin",
+  "ADMIN_PASSWORD": "admin"
+}
