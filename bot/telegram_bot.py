@@ -1,135 +1,148 @@
+# bot/telegram_bot.py - الإصدار المصحح والمحدث
 import json
 import logging
 import os
+import asyncio
 import signal
 import sys
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# -------- Load Config --------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config_bot.json")
 
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-    CFG = json.load(f)
+# تحميل الإعدادات
+try:
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        CFG = json.load(f)
+except FileNotFoundError:
+    print(f"❌ ملف الإعدادات {CONFIG_PATH} غير موجود")
+    sys.exit(1)
 
-BOT_TOKEN = CFG["BOT_TOKEN"]
-API = CFG["API_BASE_URL"].rstrip("/")
+BOT_TOKEN = CFG.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    print("❌ BOT_TOKEN غير موجود في ملف الإعدادات")
+    sys.exit(1)
+
+API = CFG.get("API_BASE_URL", "http://localhost:5000/api").rstrip("/")
 ADMIN_USER = CFG.get("ADMIN_USERNAME")
 ADMIN_PASS = CFG.get("ADMIN_PASSWORD")
 ADMIN_CHAT_IDS = CFG.get("ADMIN_CHAT_IDS", [])
 
-# per-chat admin tokens
-ADMIN_TOKENS = {}  # chat_id -> token
+ADMIN_TOKENS = {}
+client = httpx.AsyncClient(timeout=30.0)  # زيادة المهلة
 
-# -------- HTTP client --------
-client = httpx.AsyncClient(timeout=15.0)
-
-# -------- Logging --------
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# -------- Helpers --------
 def is_admin(chat_id):
-    """التحقق إذا كان المستخدم أدمن"""
-    return chat_id in ADMIN_CHAT_IDS
+    return str(chat_id) in [str(cid) for cid in ADMIN_CHAT_IDS]
+
+async def api_request(method, path, params=None, data=None, token=None):
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    
+    if data and not (isinstance(data, dict) or isinstance(data, list)):
+        headers["Content-Type"] = "application/json"
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                pass
+    
+    url = f"{API}{path}"
+    
+    try:
+        if method == "GET":
+            response = await client.get(url, params=params, headers=headers)
+        elif method == "POST":
+            response = await client.post(url, json=data, headers=headers)
+        elif method == "PUT":
+            response = await client.put(url, json=data, headers=headers)
+        elif method == "DELETE":
+            response = await client.delete(url, headers=headers)
+        else:
+            return {"ok": False, "error": "Invalid method"}
+        
+        response.raise_for_status()
+        return response.json()
+    except httpx.RequestError as e:
+        logger.error(f"API Request Error: {e}")
+        return {"ok": False, "error": f"Request error: {str(e)}"}
+    except httpx.HTTPStatusError as e:
+        logger.error(f"API HTTP Error: {e.response.status_code} - {e.response.text}")
+        return {"ok": False, "error": f"HTTP error: {e.response.status_code}"}
+    except Exception as e:
+        logger.error(f"API General Error: {e}")
+        return {"ok": False, "error": f"General error: {str(e)}"}
 
 async def api_get(path, params=None, token=None):
-    headers = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    try:
-        r = await client.get(f"{API}{path}", params=params, headers=headers)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logger.error(f"API GET Error: {e}")
-        return {"ok": False, "error": str(e)}
+    return await api_request("GET", path, params=params, token=token)
 
 async def api_post(path, data=None, token=None):
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    try:
-        r = await client.post(f"{API}{path}", json=data or {}, headers=headers)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logger.error(f"API POST Error: {e}")
-        return {"ok": False, "error": str(e)}
+    return await api_request("POST", path, data=data, token=token)
 
 async def api_put(path, data=None, token=None):
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    try:
-        r = await client.put(f"{API}{path}", json=data or {}, headers=headers)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logger.error(f"API PUT Error: {e}")
-        return {"ok": False, "error": str(e)}
+    return await api_request("PUT", path, data=data, token=token)
 
 async def api_delete(path, token=None):
-    headers = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    try:
-        r = await client.delete(f"{API}{path}", headers=headers)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logger.error(f"API DELETE Error: {e}")
-        return {"ok": False, "error": str(e)}
+    return await api_request("DELETE", path, token=token)
 
-# -------- Keyboards --------
 async def companies_keyboard():
-    data = await api_get("/companies")
-    if not data.get("ok"):
+    try:
+        data = await api_get("/companies")
+        if not data or not data.get("ok"):
+            logger.error("Failed to fetch companies: %s", data.get("error", "Unknown error"))
+            return InlineKeyboardMarkup([[InlineKeyboardButton("❌ خطأ في جلب البيانات", callback_data="noop")]])
+        
+        companies = data.get("data", [])
+        logger.info(f"Found {len(companies)} companies")
+        
+        buttons = [
+            [InlineKeyboardButton(c.get("name", "Unknown"), callback_data=f"comp:{c.get('slug', '')}")]
+            for c in companies
+        ]
+        return InlineKeyboardMarkup(buttons or [[InlineKeyboardButton("لا يوجد شركات", callback_data="noop")]])
+    except Exception as e:
+        logger.error(f"Error in companies_keyboard: {e}")
         return InlineKeyboardMarkup([[InlineKeyboardButton("❌ خطأ في جلب البيانات", callback_data="noop")]])
-    
-    companies = data.get("data", [])
-    buttons = [
-        [InlineKeyboardButton(c["name"], callback_data=f"comp:{c['slug']}")]
-        for c in companies
-    ]
-    return InlineKeyboardMarkup(buttons or [[InlineKeyboardButton("لا يوجد شركات", callback_data="noop")]])
 
 async def projects_keyboard(company_slug: str):
-    data = await api_get(f"/companies/{company_slug}")
-    if not data.get("ok"):
+    data = await api_get(f"/projects", params={"company_slug": company_slug})
+    if not data or not data.get("ok"):
+        logger.error("Failed to fetch projects for company %s: %s", company_slug, data.get("error", "Unknown error"))
         return InlineKeyboardMarkup([[InlineKeyboardButton("❌ خطأ في جلب البيانات", callback_data="back:companies")]])
     
-    company = data.get("data", {})
-    projects = company.get("projects", [])
+    projects = data.get("data", [])
     
     buttons = [
-        [InlineKeyboardButton(p["title"], callback_data=f"proj:{company_slug}:{p['id']}")]
+        [InlineKeyboardButton(p.get("title", "Unknown"), callback_data=f"proj:{company_slug}:{p.get('id', '')}")]
         for p in projects
     ]
     buttons.append([InlineKeyboardButton("⬅ رجوع", callback_data="back:companies")])
     return InlineKeyboardMarkup(buttons or [[InlineKeyboardButton("لا يوجد مشاريع", callback_data="back:companies")]])
 
-async def units_keyboard(project_id: int, page: int = 1):
+async def units_keyboard(project_id: int):
     data = await api_get("/units", params={"project_id": project_id})
-    if not data.get("ok"):
+    if not data or not data.get("ok"):
+        logger.error("Failed to fetch units for project %s: %s", project_id, data.get("error", "Unknown error"))
         return InlineKeyboardMarkup([[InlineKeyboardButton("❌ خطأ في جلب البيانات", callback_data=f"back:projects")]])
     
     units = data.get("data", [])
     buttons = []
     for u in units:
         total_price = u.get('sqm', 0) * u.get('price_per_sqm', 0)
-        label = f"{u['code']} | {u['sqm']}م² | {total_price:,} ج"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"unit:{u['id']}")])
+        label = f"{u.get('code', 'N/A')} | {u.get('sqm', 0)}م² | {total_price:,} ج"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"unit:{u.get('id', '')}")])
     
     buttons.append([InlineKeyboardButton("⬅ رجوع", callback_data=f"back:projects")])
     return InlineKeyboardMarkup(buttons or [[InlineKeyboardButton("لا يوجد وحدات", callback_data=f"back:projects")]])
 
-# -------- Commands --------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text(
@@ -138,7 +151,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """عرض chat_id الخاص بالمستخدم"""
     chat_id = update.effective_chat.id
     is_admin_user = is_admin(chat_id)
     
@@ -148,29 +160,6 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(message, parse_mode='Markdown')
 
-async def show_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """عرض المشاريع المتاحة للجميع"""
-    data = await api_get("/projects")
-    if not data.get("ok"):
-        await update.message.reply_text("❌ حدث خطأ في جلب المشاريع")
-        return
-    
-    projects = data.get("data", [])
-    
-    if not projects:
-        await update.message.reply_text("❌ لا توجد مشاريع متاحة حالياً")
-        return
-
-    message = "🏗️ *المشاريع المتاحة:*\n\n"
-    for project in projects[:10]:
-        message += f"🏢 *{project['title']}*\n"
-        message += f"📍 {project.get('location', 'غير محدد')}\n"
-        message += f"📊 الحالة: {project.get('status', 'نشط')}\n"
-        message += "─" * 20 + "\n"
-
-    await update.message.reply_text(message, parse_mode='Markdown')
-
-# -------- Callback Handler --------
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -194,7 +183,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data[0] == "unit":
         unit_id = int(data[1])
         data = await api_get(f"/units/{unit_id}")
-        if not data.get("ok"):
+        if not data or not data.get("ok"):
             await q.edit_message_text("❌ حدث خطأ في جلب بيانات الوحدة.")
             return
         
@@ -212,7 +201,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🚿 الحمامات: {unit.get('bathrooms', 0)}\n"
             f"📊 الحالة: {unit.get('status', 'غير معروف')}"
         )
-        await q.edit_message_text(msg, parse_mode='Markdown')
+        
+        # إضافة الصور إذا كانت متاحة
+        images = unit.get('images', [])
+        if images:
+            # نرسل أول صورة كمثال
+            try:
+                image_url = f"{API}/uploads/{images[0]}"
+                await context.bot.send_photo(
+                    chat_id=q.message.chat_id,
+                    photo=image_url,
+                    caption=msg,
+                    parse_mode='Markdown'
+                )
+                await q.delete_message()
+            except Exception as e:
+                logger.error(f"Error sending image: {e}")
+                await q.edit_message_text(msg + f"\n\n❌ تعذر تحميل الصورة: {e}", parse_mode='Markdown')
+        else:
+            await q.edit_message_text(msg, parse_mode='Markdown')
 
     elif data[0] == "back":
         if data[1] == "companies":
@@ -227,7 +234,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=await projects_keyboard(company_slug)
             )
 
-# -------- Admin Commands --------
 async def adminlogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     
@@ -235,9 +241,14 @@ async def adminlogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ ليس لديك صلاحية الدخول كأدمن")
         return
     
+    if not ADMIN_USER or not ADMIN_PASS:
+        await update.message.reply_text("❌ إعدادات الأدمن غير مكتملة في config_bot.json")
+        return
+    
     resp = await api_post("/auth/login", data={"username": ADMIN_USER, "password": ADMIN_PASS})
-    if not resp.get("ok"):
-        await update.message.reply_text("فشل الدخول كأدمن.")
+    if not resp or not resp.get("ok"):
+        error_msg = resp.get("error", "Unknown error") if resp else "No response"
+        await update.message.reply_text(f"فشل الدخول كأدمن: {error_msg}")
         return
         
     ADMIN_TOKENS[chat_id] = resp["access_token"]
@@ -273,14 +284,14 @@ async def add_unit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "floor": floor
     })
     
-    if resp.get("ok"):
+    if resp and resp.get("ok"):
         u = resp["data"]
-        await update.message.reply_text(f"✅ تمت إضافة وحدة: {u['code']} (ID={u['id']})")
+        await update.message.reply_text(f"✅ تمت إضافة وحدة: {u.get('code', 'N/A')} (ID={u.get('id', 'N/A')})")
     else:
-        await update.message.reply_text(f"❌ فشل: {resp.get('error')}")
+        error_msg = resp.get("error", "Unknown error") if resp else "No response"
+        await update.message.reply_text(f"❌ فشل: {error_msg}")
 
 async def delete_unit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """حذف وحدة: /delete_unit <unit_id>"""
     chat_id = update.effective_chat.id
     
     if not is_admin(chat_id):
@@ -299,13 +310,13 @@ async def delete_unit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     resp = await api_delete(f"/units/{unit_id}", token=token)
-    if resp.get("ok"):
+    if resp and resp.get("ok"):
         await update.message.reply_text(f"✅ تم حذف الوحدة رقم {unit_id}")
     else:
-        await update.message.reply_text(f"❌ فشل: {resp.get('error')}")
+        error_msg = resp.get("error", "Unknown error") if resp else "No response"
+        await update.message.reply_text(f"❌ فشل: {error_msg}")
 
 async def list_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """عرض جميع المشاريع: /list_projects"""
     chat_id = update.effective_chat.id
     
     if not is_admin(chat_id):
@@ -313,7 +324,7 @@ async def list_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     data = await api_get("/projects")
-    if not data.get("ok"):
+    if not data or not data.get("ok"):
         await update.message.reply_text("❌ خطأ في جلب المشاريع")
         return
     
@@ -325,7 +336,7 @@ async def list_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = "📋 المشاريع المتاحة:\n\n"
     for p in projects:
-        message += f"🏢 {p['title']} (ID: {p['id']})\n"
+        message += f"🏢 {p.get('title', 'N/A')} (ID: {p.get('id', 'N/A')})\n"
         message += f"📍 {p.get('location', 'لا يوجد موقع')}\n"
         message += f"🔗 Slug: {p.get('slug', 'لا يوجد')}\n"
         message += "─" * 30 + "\n"
@@ -333,7 +344,6 @@ async def list_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message)
 
 async def create_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إنشاء مشروع جديد: /create_project <company_slug> <slug> <title>"""
     chat_id = update.effective_chat.id
     
     if not is_admin(chat_id):
@@ -357,27 +367,46 @@ async def create_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "title": title
     })
     
-    if resp.get("ok"):
+    if resp and resp.get("ok"):
         await update.message.reply_text(f"✅ تم إنشاء المشروع: {title}")
     else:
-        await update.message.reply_text(f"❌ فشل: {resp.get('error')}")
+        error_msg = resp.get("error", "Unknown error") if resp else "No response"
+        await update.message.reply_text(f"❌ فشل: {error_msg}")
 
-# -------- Main --------
+async def refresh_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر جديد لتحديث البيانات يدوياً"""
+    chat_id = update.effective_chat.id
+    await update.message.reply_text("🔄 جاري تحديث البيانات...")
+    
+    # إعادة تحميل الإعدادات
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            global CFG, ADMIN_CHAT_IDS
+            CFG = json.load(f)
+            ADMIN_CHAT_IDS = CFG.get("ADMIN_CHAT_IDS", [])
+    except Exception as e:
+        logger.error(f"Error reloading config: {e}")
+    
+    await update.message.reply_text("✅ تم تحديث البيانات والإعدادات")
+
 def main():
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN غير موجود")
+        return
+    
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Command Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("myid", myid))
-    application.add_handler(CommandHandler("projects", show_projects))
     application.add_handler(CommandHandler("adminlogin", adminlogin))
     application.add_handler(CommandHandler("add_unit", add_unit))
     application.add_handler(CommandHandler("delete_unit", delete_unit))
     application.add_handler(CommandHandler("list_projects", list_projects))
     application.add_handler(CommandHandler("create_project", create_project))
+    application.add_handler(CommandHandler("refresh", refresh_data))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Run
+    print("✅ البوت يعمل الآن...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

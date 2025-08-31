@@ -1,0 +1,8 @@
+# إضافة التغييرات
+git add --all
+
+# عمل commit
+git commit -m "وصف التحديثات"
+
+# الرفع إلى GitHub
+git push origin main

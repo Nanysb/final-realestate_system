@@ -1,4 +1,4 @@
-# api/app.py
+# 1. api/app.py - بعد التعديلات
 import os
 import json
 import logging
@@ -17,9 +17,8 @@ from werkzeug.exceptions import HTTPException
 from models import db, User, Company, Project, Unit
 from utils import paginate_query
 from auth import auth_bp
-from auth import configure_jwt
 
-load_dotenv()  # Load environment variables from api/.env
+load_dotenv()
 
 ALLOWED_IMAGE_EXT = {"png", "jpg", "jpeg", "gif", "webp"}
 
@@ -27,7 +26,6 @@ def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_IMAGE_EXT
 
 def admin_required(fn):
-    """Decorator to require JWT + admin role"""
     @wraps(fn)
     def wrapper(*args, **kwargs):
         try:
@@ -42,14 +40,7 @@ def admin_required(fn):
 
 def create_app():
     app = Flask(__name__, instance_relative_config=True)
-
-     # إعداد JWT
-     
-    jwt = configure_jwt(app)
-
     
-    # باقي الإعدادات...
-
     CORS(app, 
          origins=["http://localhost:3000", "http://127.0.0.1:3000"],
          supports_credentials=True,
@@ -66,6 +57,8 @@ def create_app():
     app.config["SQLALCHEMY_DATABASE_URI"] = db_url
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
     app.config["JWT_SECRET_KEY"] = jwt_secret
+    app.config["JWT_ACCESS_TOKEN_EXPIRES"] = 3600
+    app.config["JWT_REFRESH_TOKEN_EXPIRES"] = 604800
 
     uploads = instance_path / "uploads"
     os.makedirs(uploads, exist_ok=True)
@@ -84,8 +77,7 @@ def create_app():
 
     # ---------- Extensions ----------
     db.init_app(app)
-    JWTManager(app)
-
+    jwt = JWTManager(app)
     migrate = Migrate(app, db)
 
     # ---------- Error handlers ----------
@@ -99,10 +91,7 @@ def create_app():
         return jsonify({"ok": False, "error": "Internal Server Error", "message": str(e)}), 500
 
     # ---------- Blueprints ----------
-    try:
-        app.register_blueprint(auth_bp)
-    except Exception as e:
-        app.logger.warning("Could not register auth blueprint: %s", e)
+    app.register_blueprint(auth_bp)
 
     # ---------- Helpers ----------
     def save_uploaded_files(files_list):
@@ -111,22 +100,28 @@ def create_app():
             if f and allowed_file(f.filename):
                 filename = secure_filename(f.filename)
                 target = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+                
+                # تأكد من وجود المجلد
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                
                 base, ext = os.path.splitext(filename)
                 idx = 1
                 while os.path.exists(target):
                     filename = f"{base}_{idx}{ext}"
                     target = os.path.join(app.config["UPLOAD_FOLDER"], filename)
                     idx += 1
+                
                 f.save(target)
                 saved_files.append(filename)
+                app.logger.info(f"Saved file: {filename}")
         return saved_files
 
     # ---------- Public Endpoints ----------
     @app.route("/")
     def home():
-        return jsonify({"message": "Real Estate API is running Good job Radoo "})
+        return jsonify({"message": "Real Estate API is running radooo"})
 
-    @app.route("/api/health")
+    @app.route("/api/health")   
     def health():
         return jsonify({"ok": True, "status": "API running"})
 
@@ -162,6 +157,7 @@ def create_app():
         )
         db.session.add(c)
         db.session.commit()
+        app.logger.info(f"Company created: {slug}")
         return jsonify({"ok": True, "data": c.to_dict()}), 201
 
     @app.route("/api/companies/<int:cid>", methods=["PUT"])
@@ -188,6 +184,7 @@ def create_app():
             c.contact_info = json.dumps(data["contact_info"]) if data["contact_info"] else None
         
         db.session.commit()
+        app.logger.info(f"Company updated: {c.slug}")
         return jsonify({"ok": True, "data": c.to_dict()})
 
     @app.route("/api/companies/<int:cid>", methods=["DELETE"])
@@ -196,6 +193,7 @@ def create_app():
         c = Company.query.get_or_404(cid)
         db.session.delete(c)
         db.session.commit()
+        app.logger.info(f"Company deleted: {cid}")
         return jsonify({"ok": True, "message": "Company deleted successfully"})
 
     # ---------- Projects ----------
@@ -217,7 +215,6 @@ def create_app():
         items = q.order_by(Project.order.asc().nullslast(), Project.created_at.desc()).all()
         res = [p.to_dict() for p in items]
         
-        # Add full image URLs
         for project in res:
             project["images"] = [url_for("uploaded_file", filename=fn, _external=True) 
                                 for fn in project["images"]]
@@ -237,7 +234,6 @@ def create_app():
     def create_project():
         if request.content_type and request.content_type.startswith("multipart/form-data"):
             data = request.form.to_dict()
-            # Parse JSON fields
             for field in ["features"]:
                 if field in data and data[field]:
                     try:
@@ -271,19 +267,18 @@ def create_app():
         db.session.add(p)
         db.session.commit()
 
-        # Handle image uploads
         saved_files = []
         if request.files:
             files = request.files.getlist("images")
             saved_files = save_uploaded_files(files)
             
             if saved_files:
-                # Get existing images and add new ones
                 existing_images = p.get_images()
                 existing_images.extend(saved_files)
                 p.images = json.dumps(existing_images)
                 db.session.commit()
 
+        app.logger.info(f"Project created: {slug}")
         return jsonify({"ok": True, "data": p.to_dict()}), 201
 
     @app.route("/api/projects/<int:pid>", methods=["PUT"])
@@ -293,7 +288,6 @@ def create_app():
         
         if request.content_type and request.content_type.startswith("multipart/form-data"):
             data = request.form.to_dict()
-            # Parse JSON fields
             for field in ["features"]:
                 if field in data and data[field]:
                     try:
@@ -304,7 +298,6 @@ def create_app():
             data = request.get_json() or {}
             
         if "slug" in data:
-            # Check if slug is already used by another project
             if Project.query.filter(Project.slug == data["slug"], Project.id != pid).first():
                 return jsonify({"ok": False, "error": "slug exists"}), 409
             p.slug = data["slug"]
@@ -317,6 +310,7 @@ def create_app():
             p.features = json.dumps(data["features"])
                 
         db.session.commit()
+        app.logger.info(f"Project updated: {p.slug}")
         return jsonify({"ok": True, "data": p.to_dict()})
 
     @app.route("/api/projects/<int:pid>", methods=["DELETE"])
@@ -325,6 +319,7 @@ def create_app():
         p = Project.query.get_or_404(pid)
         db.session.delete(p)
         db.session.commit()
+        app.logger.info(f"Project deleted: {pid}")
         return jsonify({"ok": True, "message": "Project deleted successfully"})
 
     @app.route("/api/projects/<int:pid>/upload", methods=["POST"])
@@ -338,12 +333,12 @@ def create_app():
         saved_files = save_uploaded_files(files)
 
         if saved_files:
-            # Get existing images and add new ones
             existing_images = p.get_images()
             existing_images.extend(saved_files)
             p.images = json.dumps(existing_images)
             db.session.commit()
 
+        app.logger.info(f"Uploaded {len(saved_files)} files to project {pid}")
         return jsonify({"ok": True, "data": saved_files})
 
     # ---------- Upload Endpoint ----------
@@ -361,7 +356,6 @@ def create_app():
             filename = secure_filename(file.filename)
             target = os.path.join(app.config["UPLOAD_FOLDER"], filename)
             
-            # منع التكرار
             base, ext = os.path.splitext(filename)
             idx = 1
             while os.path.exists(target):
@@ -370,6 +364,7 @@ def create_app():
                 idx += 1
             
             file.save(target)
+            app.logger.info(f"File uploaded: {filename}")
             return jsonify({"ok": True, "filename": filename})
         
         return jsonify({"ok": False, "error": "File type not allowed"}), 400
@@ -405,7 +400,6 @@ def create_app():
         if floor:
             units = [u for u in units if str(u.get("floor")) == str(floor)]
 
-        # Add full image URLs
         for unit in units:
             unit["images"] = [url_for("uploaded_file", filename=fn, _external=True) 
                              for fn in unit["images"]]
@@ -422,7 +416,6 @@ def create_app():
     def get_unit(uid):
         u = Unit.query.get_or_404(uid)
         data = u.to_dict()
-        # Add full image URLs
         data["images"] = [url_for("uploaded_file", filename=fn, _external=True) 
                          for fn in data["images"]]
         if data["floor_plan"]:
@@ -434,7 +427,6 @@ def create_app():
     def create_unit():
         if request.content_type and request.content_type.startswith("multipart/form-data"):
             data = request.form.to_dict()
-            # Parse JSON fields
             for field in ["amenities", "metadata"]:
                 if field in data and data[field]:
                     try:
@@ -471,7 +463,6 @@ def create_app():
         db.session.add(u)
         db.session.commit()
         
-        # Handle image uploads
         saved_files = []
         if request.files:
             files = request.files.getlist("images")
@@ -481,7 +472,6 @@ def create_app():
                 u.images = json.dumps(saved_files)
                 db.session.commit()
                 
-        # Handle floor plan upload
         if "floor_plan" in request.files:
             floor_plan_file = request.files["floor_plan"]
             if floor_plan_file and allowed_file(floor_plan_file.filename):
@@ -497,6 +487,7 @@ def create_app():
                 u.floor_plan = filename
                 db.session.commit()
 
+        app.logger.info(f"Unit created: {code}")
         return jsonify({"ok": True, "data": u.to_dict()}), 201
 
     @app.route("/api/units/<int:uid>", methods=["PUT"])
@@ -506,7 +497,6 @@ def create_app():
         
         if request.content_type and request.content_type.startswith("multipart/form-data"):
             data = request.form.to_dict()
-            # Parse JSON fields
             for field in ["amenities", "metadata"]:
                 if field in data and data[field]:
                     try:
@@ -517,8 +507,8 @@ def create_app():
             data = request.get_json() or {}
             
         for field in ["code", "title", "floor", "status"]:
-            if field in data and data["field"] is not None:
-                setattr(u, field, str(data["field"]))
+            if field in data and data[field] is not None:
+                setattr(u, field, str(data[field]))
                 
         if "sqm" in data and data["sqm"] is not None:
             u.sqm = float(data["sqm"])
@@ -538,18 +528,15 @@ def create_app():
         if "metadata" in data:
             u.unit_metadata = json.dumps(data["metadata"])
             
-        # Handle image uploads
         if "images" in request.files:
             files = request.files.getlist("images")
             saved_files = save_uploaded_files(files)
             
             if saved_files:
-                # Get existing images and add new ones
                 existing_images = u.get_images()
                 existing_images.extend(saved_files)
                 u.images = json.dumps(existing_images)
                 
-        # Handle floor plan upload
         if "floor_plan" in request.files:
             floor_plan_file = request.files["floor_plan"]
             if floor_plan_file and allowed_file(floor_plan_file.filename):
@@ -565,6 +552,7 @@ def create_app():
                 u.floor_plan = filename
         
         db.session.commit()
+        app.logger.info(f"Unit updated: {u.code}")
         return jsonify({"ok": True, "data": u.to_dict()})
 
     @app.route("/api/units/<int:uid>", methods=["DELETE"])
@@ -573,6 +561,7 @@ def create_app():
         u = Unit.query.get_or_404(uid)
         db.session.delete(u)
         db.session.commit()
+        app.logger.info(f"Unit deleted: {uid}")
         return jsonify({"ok": True, "message": "Unit deleted successfully"})
 
     @app.route("/api/units/<int:uid>/upload", methods=["POST"])
@@ -583,18 +572,15 @@ def create_app():
             return jsonify({"ok": False, "error": "No files provided"}), 400
 
         saved_files = []
-        # Handle images
         if "images" in request.files:
             files = request.files.getlist("images")
             saved_files = save_uploaded_files(files)
             
             if saved_files:
-                # Get existing images and add new ones
                 existing_images = u.get_images()
                 existing_images.extend(saved_files)
                 u.images = json.dumps(existing_images)
                 
-        # Handle floor plan
         if "floor_plan" in request.files:
             floor_plan_file = request.files["floor_plan"]
             if floor_plan_file and allowed_file(floor_plan_file.filename):
@@ -611,12 +597,17 @@ def create_app():
                 saved_files.append(filename)
 
         db.session.commit()
+        app.logger.info(f"Uploaded {len(saved_files)} files to unit {uid}")
         return jsonify({"ok": True, "data": saved_files})
 
-    # Serve uploaded files
+    # Serve uploaded files - مع handling للأخطاء
     @app.route("/api/uploads/<path:filename>")
     def uploaded_file(filename):
-        return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+        try:
+            return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+        except FileNotFoundError:
+            app.logger.warning(f"File not found: {filename}")
+            return jsonify({"ok": False, "error": "File not found"}), 404
 
     # ---------- App context initialization ----------
     with app.app_context():
@@ -632,7 +623,6 @@ def create_app():
 
     return app
 
-# ---------- Entrypoint ----------
 if __name__ == "__main__":
     from waitress import serve
     app = create_app()

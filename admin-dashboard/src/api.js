@@ -1,14 +1,12 @@
-// admin-dashboard/src/api.js
+// 4. admin-dashboard/src/api.js - الإصدار المصحح
 import axios from "axios";
 
 const API_BASE_URL = "http://localhost:5000/api";
 
-// إنشاء instance مخصص لـ axios
 const api = axios.create({
   baseURL: API_BASE_URL,
 });
 
-// حالة الـ refresh
 let isRefreshing = false;
 let failedQueue = [];
 
@@ -23,7 +21,6 @@ const processQueue = (error, token = null) => {
   failedQueue = [];
 };
 
-// interceptor لإضافة Token
 api.interceptors.request.use(
   (config) => {
     const token = localStorage.getItem("admin_token");
@@ -37,13 +34,11 @@ api.interceptors.request.use(
   }
 );
 
-// interceptor للتعامل مع الأخطاء
 api.interceptors.response.use(
   (response) => response,
   async (error) => {
     const originalRequest = error.config;
 
-    // إذا كان الخطأ 401 ولم يكن طلب refresh
     if (error.response?.status === 401 && 
         !originalRequest._retry && 
         !originalRequest.url.includes('/auth/')) {
@@ -53,7 +48,7 @@ api.interceptors.response.use(
           failedQueue.push({ resolve, reject });
         }).then(token => {
           originalRequest.headers.Authorization = `Bearer ${token}`;
-          return api(originalRequest);
+          return api(originalRequest);  // ✅ الإصلاح هنا
         }).catch(err => {
           return Promise.reject(err);
         });
@@ -81,7 +76,7 @@ api.interceptors.response.use(
           originalRequest.headers.Authorization = `Bearer ${newAccessToken}`;
           processQueue(null, newAccessToken);
           
-          return api(originalRequest);
+          return api(originalRequest);  // ✅ الإصلاح هنا
         }
       } catch (refreshError) {
         processQueue(refreshError, null);
@@ -99,7 +94,6 @@ api.interceptors.response.use(
   }
 );
 
-// دالة تسجيل الدخول
 export const loginAdmin = async (username, password) => {
   try {
     const response = await api.post("/auth/login", {
@@ -111,7 +105,6 @@ export const loginAdmin = async (username, password) => {
       localStorage.setItem("admin_token", response.data.access_token);
       localStorage.setItem("admin_refresh_token", response.data.refresh_token);
       localStorage.setItem("user_data", JSON.stringify(response.data.user));
-      console.log("✅ Login successful");
     }
     return response.data;
   } catch (error) {
@@ -120,7 +113,6 @@ export const loginAdmin = async (username, password) => {
   }
 };
 
-// دالة التحقق من التوكن
 export const verifyToken = async () => {
   try {
     const response = await api.get("/auth/verify");
@@ -131,7 +123,6 @@ export const verifyToken = async () => {
   }
 };
 
-// دالة تسجيل الخروج
 export const logoutAdmin = async () => {
   try {
     await api.post("/auth/logout");
@@ -145,7 +136,6 @@ export const logoutAdmin = async () => {
   }
 };
 
-// دوال Companies
 export const getCompanies = async () => {
   try {
     const response = await api.get("/companies");
@@ -186,7 +176,6 @@ export const deleteCompany = async (id) => {
   }
 };
 
-// دوال Projects
 export const getProjects = async (params = {}) => {
   try {
     const response = await api.get("/projects", { params });
@@ -237,7 +226,6 @@ export const deleteProject = async (id) => {
   }
 };
 
-// دوال Units
 export const getUnits = async (params = {}) => {
   try {
     const response = await api.get("/units", { params });
@@ -288,7 +276,6 @@ export const deleteUnit = async (id) => {
   }
 };
 
-// دوال Upload
 export const uploadFile = async (fileData) => {
   try {
     const response = await api.post("/upload", fileData, {
@@ -346,7 +333,6 @@ export const uploadUnitFiles = async (unitId, files) => {
   }
 };
 
-// دوال المساعدة
 export const getCurrentUser = () => {
   const userData = localStorage.getItem("user_data");
   return userData ? JSON.parse(userData) : null;
@@ -362,3 +348,4 @@ export const getAuthHeaders = () => {
 };
 
 export default api;
+

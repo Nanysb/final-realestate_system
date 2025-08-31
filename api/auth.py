@@ -1,3 +1,4 @@
+# 2. api/auth.py - الإصدار المصحح
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import (
     create_access_token, 
@@ -8,17 +9,10 @@ from flask_jwt_extended import (
     JWTManager
 )
 from models import db, User
-from datetime import datetime, timedelta
+from datetime import timedelta
 import os
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
-
-# إعدادات JWT
-def configure_jwt(app):
-    app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "fallback-secret-key-change-in-production")
-    app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)
-    app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=7)
-    return JWTManager(app)
 
 @auth_bp.post("/register")
 @jwt_required()
@@ -68,7 +62,6 @@ def login():
         if not u or not u.check_password(password):
             return jsonify({"ok": False, "error": "Invalid credentials"}), 401
 
-        # إنشاء كلا التوكنين مع expiration times
         access_token = create_access_token(
             identity=str(u.id), 
             additional_claims={
@@ -108,7 +101,6 @@ def verify_token():
         claims = get_jwt()
         current_user = get_jwt_identity()
         
-        # تحقق من نوع التوكن
         if claims.get("type") != "access":
             return jsonify({"ok": False, "error": "Invalid token type"}), 401
             
@@ -131,11 +123,9 @@ def refresh():
         claims = get_jwt()
         current_user = get_jwt_identity()
         
-        # تحقق من أن هذا توكن refresh
         if claims.get("type") != "refresh":
             return jsonify({"ok": False, "error": "Invalid refresh token"}), 422
             
-        # إنشاء access token جديد
         new_access_token = create_access_token(
             identity=current_user,
             additional_claims={
@@ -157,8 +147,6 @@ def refresh():
 @jwt_required()
 def logout():
     try:
-        # في نظام JWT، التسجيل الخروج يكون على جانب العميل
-        # ولكن يمكننا إضافة التوكن إلى blacklist إذا أردنا
         return jsonify({
             "ok": True, 
             "message": "Logged out successfully"
@@ -169,17 +157,11 @@ def logout():
 
 @auth_bp.post('/validate')
 def validate_token():
-    """دالة لتحقق من صحة التوكن بدون @jwt_required"""
     try:
         auth_header = request.headers.get('Authorization')
         if not auth_header or not auth_header.startswith('Bearer '):
             return jsonify({"ok": False, "error": "Token missing"}), 401
             
-        token = auth_header.split(' ')[1]
-        
-        # هنا يمكنك إضافة تحقق من الـ token إذا needed
-        # لكن في هذه الحالة نعود نجاح لأن middleware يتحقق تلقائياً
-        
         return jsonify({"ok": True, "message": "Token is valid"})
         
     except Exception as e:
