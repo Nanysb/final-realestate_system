@@ -41,7 +41,7 @@ const FileUploader = ({
         formData.append('type', fileType);
 
         const response = await callApi(() => 
-          API.post('/api/upload', formData, {
+          API.post('/upload', formData, {
             headers: {
               'Content-Type': 'multipart/form-data'
             },

@@ -17,6 +17,7 @@ from werkzeug.exceptions import HTTPException
 from models import db, User, Company, Project, Unit
 from utils import paginate_query
 from auth import auth_bp
+from auth import configure_jwt
 
 load_dotenv()  # Load environment variables from api/.env
 
@@ -41,7 +42,19 @@ def admin_required(fn):
 
 def create_app():
     app = Flask(__name__, instance_relative_config=True)
-    CORS(app, origins=["http://localhost:3000"], supports_credentials=True)
+
+     # إعداد JWT
+     
+    jwt = configure_jwt(app)
+
+    
+    # باقي الإعدادات...
+
+    CORS(app, 
+         origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+         supports_credentials=True,
+         allow_headers=["Content-Type", "Authorization", "Content-Disposition"],
+         methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"])
 
     # ---------- Config ----------
     instance_path = Path(app.instance_path)
@@ -333,6 +346,34 @@ def create_app():
 
         return jsonify({"ok": True, "data": saved_files})
 
+    # ---------- Upload Endpoint ----------
+    @app.route("/api/upload", methods=["POST"])
+    @admin_required
+    def upload_file():
+        if 'file' not in request.files:
+            return jsonify({"ok": False, "error": "No file provided"}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({"ok": False, "error": "No file selected"}), 400
+        
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            target = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+            
+            # منع التكرار
+            base, ext = os.path.splitext(filename)
+            idx = 1
+            while os.path.exists(target):
+                filename = f"{base}_{idx}{ext}"
+                target = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+                idx += 1
+            
+            file.save(target)
+            return jsonify({"ok": True, "filename": filename})
+        
+        return jsonify({"ok": False, "error": "File type not allowed"}), 400
+
     # ---------- Units ----------
     @app.route("/api/units", methods=["GET"])
     def list_units():
@@ -476,8 +517,8 @@ def create_app():
             data = request.get_json() or {}
             
         for field in ["code", "title", "floor", "status"]:
-            if field in data and data[field] is not None:
-                setattr(u, field, str(data[field]))
+            if field in data and data["field"] is not None:
+                setattr(u, field, str(data["field"]))
                 
         if "sqm" in data and data["sqm"] is not None:
             u.sqm = float(data["sqm"])

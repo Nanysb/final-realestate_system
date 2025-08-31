@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import signal
+import sys
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
